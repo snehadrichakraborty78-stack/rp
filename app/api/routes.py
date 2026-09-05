@@ -15,6 +15,7 @@ import csv
 import hashlib
 import io
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -46,13 +47,63 @@ router = APIRouter(prefix="/batches", tags=["batches"])
 # ═══════════════════════════════════════════════════════════
 #  HELPERS
 # ═══════════════════════════════════════════════════════════
+from langchain_openai import ChatOpenAI
+from langchain_core.language_models.chat_models import BaseChatModel
+from app.agent.tools import (
+    query_order,
+    query_refund,
+    query_dispute,
+    query_settlement,
+    query_bank_transaction,
+    check_fee_schedule,
+)
+
+def _default_llm_factory(model_name: str) -> BaseChatModel:
+    """Initialize models using OpenAI's compatible endpoint for both Groq and OpenAI."""
+    if model_name.startswith("groq/"):
+        groq_model = model_name.replace("groq/", "")
+        return ChatOpenAI(
+            model=groq_model,
+            api_key=os.getenv("GROQ_API_KEY", ""),
+            base_url="https://api.groq.com/openai/v1",
+            temperature=0,
+            max_retries=2,
+        )
+    
+    return ChatOpenAI(
+        model=model_name,
+        api_key=os.getenv("OPENAI_API_KEY", ""),
+        temperature=0,
+        max_retries=2,
+    )
+
+DEFAULT_TOOL_MAP = {
+    "query_order": query_order,
+    "query_refund": query_refund,
+    "query_dispute": query_dispute,
+    "query_settlement": query_settlement,
+    "query_bank_transaction": query_bank_transaction,
+    "check_fee_schedule": check_fee_schedule,
+}
 
 
-def _parse_csv(content: bytes) -> list[dict[str, str]]:
-    """Parse raw CSV bytes into a list of dicts."""
+def _parse_csv(content: bytes) -> list[dict[str, Any]]:
+    """Parse raw CSV bytes into a list of dicts, casting integer fields."""
     text = content.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text))
-    return [dict(row) for row in reader]
+    rows = []
+    for row in reader:
+        parsed = {}
+        for k, v in row.items():
+            if k and v and (k.endswith("_paise") or k.endswith("_points") or k.endswith("_bps")):
+                try:
+                    parsed[k] = int(v)
+                except ValueError:
+                    parsed[k] = v
+            else:
+                parsed[k] = v
+        rows.append(parsed)
+    return rows
 
 
 async def _run_pipeline_background(
@@ -82,6 +133,8 @@ async def _run_pipeline_background(
                     disputes=disputes,
                     source_checksum=source_checksum,
                     eval_mode=eval_mode,
+                    llm_factory=_default_llm_factory,
+                    tool_map=DEFAULT_TOOL_MAP,
                 )
     except Exception:
         logger.exception("Background pipeline failed for run %s", run_id)
